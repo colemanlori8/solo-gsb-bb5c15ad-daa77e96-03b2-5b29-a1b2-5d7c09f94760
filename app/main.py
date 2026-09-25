@@ -4,8 +4,12 @@
 按原时刻排序后在相邻锚点间做线性插值，两端按最近一段的斜率外推，
 统一换算每条字幕的起止时间，并检测负时间 / 起止倒置 / 与下一条重叠。
 """
+import csv
+import difflib
+import io
 import math
 import re
+import unicodedata
 from pathlib import Path
 from typing import List
 
@@ -13,7 +17,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复")
+app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -1093,4 +1097,485 @@ def speed_export(req: SpeedRequest):
         content=content.encode("utf-8"),
         media_type="application/x-subrip",
         headers={"Content-Disposition": 'attachment; filename="speed_fixed.srt"'},
+    )
+
+
+# ---------------------------------------------------------------- SRT 修订差异对照
+
+class DiffRequest(BaseModel):
+    old_srt: str  # 旧版 SRT
+    new_srt: str  # 新版 SRT
+
+
+DIFF_SIM_THRESHOLD = 0.5   # 仅相似度至少 0.5 的组合才允许匹配
+SIM_SCALE = 1_000_000_000  # 相似度定点放大倍数（总相似度按整数精确比较）
+MAX_DIFF_GRID = 4_000_000  # 两侧条目数乘积（对齐计算规模）上限
+
+
+def _normalize_text(s: str) -> str:
+    """归一化正文：去空白、去标点、小写化（全角字符先兼容分解）。
+
+    兼容分解（NFKD）会把全角字母数字转为半角，故在分解后逐字符按类别
+    过滤；日文假名等无兼容分解的字符按原形保留。
+    """
+    return "".join(
+        ch.casefold()
+        for ch in unicodedata.normalize("NFKD", s)
+        if not ch.isspace() and not _is_punct(ch)
+    )
+
+
+def _is_punct(ch: str) -> bool:
+    """是否为标点符号（覆盖中英文常见标点及 Unicode P* 类别）。"""
+    if unicodedata.category(ch).startswith("P"):
+        return True
+    return ch in "，。！？；：、""''（）《》【】…—·「」『』〈〉"
+
+
+def _entry_body(entries: List[dict], idxs) -> str:
+    """按原顺序拼接组内字幕正文（条目之间以换行连接）。"""
+    return "\n".join("\n".join(entries[i]["lines"]) for i in idxs)
+
+
+def _norm_body(entries: List[dict], idxs) -> str:
+    return _normalize_text(_entry_body(entries, idxs))
+
+
+# ---- 相似度 ≥ 0.5 的候选预筛（避免对全网格逐格跑 difflib 精确块匹配）----
+#
+# SequenceMatcher.ratio = 2M/(|a|+|b|)，M 为等长匹配块总长度，且 M 不超过
+# 字符多重集交集 C = Σ_ch min(na(ch), nb(ch))。故 ratio ≥ 0.5 必有
+# C ≥ (|a|+|b|)/4；反之可安全剪枝。
+# 直接逐字符求 C 仍要字典遍历；改用多组散列桶位掩码得到 C 的廉价上界：
+# 对每组独立 256 桶散列，记 A_t/B_t 为落在桶 t 的字符总数，桶级交集
+# B = Σ_{共享桶} min(A_t,B_t) ≥ C（哈希碰撞只会合并计数，上界只增不减）；
+# 再用 k=共享桶数、D=各自占用桶数放缩为 B ≤ k + min(|a|-D_a, |b|-D_b)，
+# 全程仅需缓存的位掩码与 popcount。取多组散列上界的最小值，碰撞同时发生
+# 的概率可忽略，无关句子在这一级即被剔除；漏报在数学上不可能。
+
+DIFF_HASH_GROUPS = 4
+DIFF_BUCKET_BITS = 8
+DIFF_BUCKETS = 1 << DIFF_BUCKET_BITS  # 256
+
+
+def _bucket_masks(s: str):
+    """文本在多组独立散列下的桶占用签名：(长度, 掩码组, 各组占用桶数)。"""
+    masks = [0] * DIFF_HASH_GROUPS
+    for ch in s:
+        h0 = ord(ch)
+        for r in range(DIFF_HASH_GROUPS):
+            h = (h0 + 0x9e3779b9 * (r + 1)) & 0xFFFFFFFF
+            h ^= h >> 16
+            h = (h * 0x7feb352d) & 0xFFFFFFFF
+            h ^= h >> 15
+            h = (h * 0x846ca68b) & 0xFFFFFFFF
+            masks[r] |= 1 << ((h ^ (h >> 16)) & (DIFF_BUCKETS - 1))
+    return len(s), tuple(masks), tuple(m.bit_count() for m in masks)
+
+
+def _sig_passes(la, ma, oa, lb, mb, ob, need: int) -> bool:
+    """多重集交集上界剪枝：返回 False 时相似度必 < 阈值（绝不漏报）。
+
+    逐组散列独立判断，第一组即剔除时立即返回（绝大多数无关对在此结束）。
+    """
+    for r in range(DIFF_HASH_GROUPS):
+        k = (ma[r] & mb[r]).bit_count()
+        # k + min(la-oa[r], lb-ob[r]) 是该组桶级交集的上界
+        da, db = la - oa[r], lb - ob[r]
+        if k + (da if da < db else db) < need:
+            return False
+    return True
+
+
+def _try_similarity(sig_a, sig_b):
+    """计算精确相似度；廉价上界判定必不足 DIFF_SIM_THRESHOLD 时返回 None。
+
+    入参为 (归一化正文, 长度, 掩码组, 占用数组)。
+    """
+    a, la, ma, oa = sig_a
+    b, lb, mb, ob = sig_b
+    if a == b:
+        return 1.0  # 含双方正文均为空：ratio=1.0
+    if la == 0 or lb == 0:
+        return None
+    if min(la, lb) * 3 < max(la, lb):
+        return None  # 长度比 < 1/3 时 ratio 必 < 0.5
+    need = (la + lb + 3) // 4  # ceil((la+lb)/4)
+    if not _sig_passes(la, ma, oa, lb, mb, ob, need):
+        return None
+    sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
+    r = sm.ratio()
+    return r if r >= DIFF_SIM_THRESHOLD else None
+
+
+def _validate_diff_track(entries: List[dict], track: str) -> None:
+    """差异对照输入轨：空时长（终点=起点）或起止倒置（终点<起点）即报错。"""
+    _validate_track_duration(entries, track)
+
+
+def align_diff(old_entries: List[dict], new_entries: List[dict]):
+    """保序全局动态规划对齐旧、新两版字幕。
+
+    每个对齐组允许以下形态（旧侧条数 → 新侧条数）：
+      1:1 改词/未变、1:2 拆分、2:1 合并、1:0 删除、0:1 新增。
+    匹配组（前三种）仅在归一化正文相似度 ≥ 0.5 时成立。
+
+    目标按字典序：
+      1) 最大化全部匹配组相似度之和；
+      2) 总相似度并列时，最小化全部匹配组时间差（中点差毫秒）之和。
+    单侧跳过（删除/新增）不参与打分，故只在确实没有更优匹配时出现。
+
+    三级比较编码为单个整数：value = 相似度和 × SIM_SCALE × W − 时间差和，
+    其中 W 取（严格大于任何方案时间差和上界的）整数，从而先比相似度、
+    再比时间差。相似度以 SIM_SCALE 定点化为整数（误差 < 1e-9/组），
+    比较顺序与逐组有理数求和一致。
+
+    返回对齐组列表，每组：
+      {kind, old:[seq...], new:[seq...], score:float, gap_ms:float}
+    kind 为 raw_11 / raw_split / raw_merge / raw_del / raw_add；
+    raw_11 组在展示阶段再按归一化正文是否相同细分为未变 / 改词。
+    """
+    m, n = len(old_entries), len(new_entries)
+    if m * n > MAX_DIFF_GRID:
+        raise ValueError(
+            f"两版字幕条目数乘积 {m}×{n} 超过对齐计算上限 {MAX_DIFF_GRID}，"
+            "请确认两版为同一片源后裁短再试"
+        )
+
+    def _rec(s: str):
+        length, masks, occ = _bucket_masks(s)
+        return (s, length, masks, occ)
+
+    old_rec = [_rec(_normalize_text("\n".join(e["lines"]))) for e in old_entries]
+    new_rec = [_rec(_normalize_text("\n".join(e["lines"]))) for e in new_entries]
+    # 1:2 / 2:1 组的拼接正文各只需 n-1 / m-1 份，预先构造一次，避免网格内反复拼接
+    old_pair_rec = [_rec(a[0] + b[0]) for a, b in zip(old_rec, old_rec[1:])]
+    new_pair_rec = [_rec(a[0] + b[0]) for a, b in zip(new_rec, new_rec[1:])]
+
+    # 拍平为并行数组，供热循环按下标直接访问（避免逐格元组拆装）
+    ot = [r[0] for r in old_rec]
+    ol = [r[1] for r in old_rec]
+    om = [[r[2][g] for r in old_rec] for g in range(DIFF_HASH_GROUPS)]
+    oo = [[r[3][g] for r in old_rec] for g in range(DIFF_HASH_GROUPS)]
+    nt = [r[0] for r in new_rec]
+    nl_ = [r[1] for r in new_rec]
+    nm = [[r[2][g] for r in new_rec] for g in range(DIFF_HASH_GROUPS)]
+    no_ = [[r[3][g] for r in new_rec] for g in range(DIFF_HASH_GROUPS)]
+    npt = [r[0] for r in new_pair_rec]
+    npl = [r[1] for r in new_pair_rec]
+    npm = [[r[2][g] for r in new_pair_rec] for g in range(DIFF_HASH_GROUPS)]
+    npo = [[r[3][g] for r in new_pair_rec] for g in range(DIFF_HASH_GROUPS)]
+    opt = [r[0] for r in old_pair_rec]
+    opl = [r[1] for r in old_pair_rec]
+    opm = [[r[2][g] for r in old_pair_rec] for g in range(DIFF_HASH_GROUPS)]
+    opo = [[r[3][g] for r in old_pair_rec] for g in range(DIFF_HASH_GROUPS)]
+    # 每条新侧条目的 (长度, 各组掩码, 各组占用数) 只组装一次
+    new_sig_cols = [
+        (nl_[j], tuple(nm[g][j] for g in range(DIFF_HASH_GROUPS)),
+         tuple(no_[g][j] for g in range(DIFF_HASH_GROUPS)))
+        for j in range(n)
+    ]
+    new_pair_cols = [
+        (npl[j], tuple(npm[g][j] for g in range(DIFF_HASH_GROUPS)),
+         tuple(npo[g][j] for g in range(DIFF_HASH_GROUPS)))
+        for j in range(n - 1)
+    ]
+
+    # W 严格大于任何方案的时间差总和上界：最多 min(m,n) 个匹配组，
+    # 每组中点差（2 倍值）不超过两侧中点取值的全局极差，故
+    # W = min(m,n)*pmax + 1。单侧为空时没有匹配组，w 取任意正值即可。
+    mid_o = [e["start"] + e["end"] for e in old_entries]
+    mid_n = [e["start"] + e["end"] for e in new_entries]
+    if m > 0 and n > 0:
+        w = min(m, n) * (max(max(mid_o), max(mid_n))
+                         - min(min(mid_o), min(mid_n))) + 1
+    else:
+        w = 1
+
+    def _exact(a, b):
+        """已通过桶上界剪枝后的精确相似度，不足阈值返回 None。"""
+        s = difflib.SequenceMatcher(a=a, b=b, autojunk=False).ratio()
+        return s if s >= DIFF_SIM_THRESHOLD else None
+
+    def _candidate_score(la, am, ao, lb, bm, bo, a, b):
+        """热循环中的候选相似度：等串快路 → 长度 → 0 号桶（绝大多数在此剔除）
+        → 其余散列组 → 精确块匹配。返回 None 表示不足阈值。"""
+        if a == b:
+            return 1.0
+        if la == 0 or lb == 0 or min(la, lb) * 3 < max(la, lb):
+            return None
+        need = (la + lb + 3) >> 2
+        da0, db0 = la - ao[0], lb - bo[0]
+        if (am[0] & bm[0]).bit_count() + (da0 if da0 < db0 else db0) < need:
+            return None
+        for g in range(1, DIFF_HASH_GROUPS):
+            da, db = la - ao[g], lb - bo[g]
+            if (am[g] & bm[g]).bit_count() + (da if da < db else db) < need:
+                return None
+        return _exact(a, b)
+
+    # 网格 dp[i][j]：旧侧消费 i 条、新侧消费 j 条时的最优整数值。
+    # 五种转移（i/j 为已消费条数）：
+    #   删除旧 i：dp[i][j]   <- dp[i-1][j]   （TAG_DEL）
+    #   新增新 j：dp[i][j]   <- dp[i][j-1]   （TAG_ADD）
+    #   1:1 匹配：dp[i][j]   <- dp[i-1][j-1]（TAG_M11，相似度≥0.5）
+    #   1:2 拆分：dp[i][j]   <- dp[i-1][j-2]（TAG_M12）
+    #   2:1 合并：dp[i][j]   <- dp[i-2][j-1]（TAG_M21）
+    # dp 值只保留三行滚动；回溯标签存整张网格的 bytearray（每格 1 字节）。
+    TAG_DEL, TAG_ADD, TAG_M11, TAG_M12, TAG_M21 = 1, 2, 3, 4, 5
+    width = n + 1
+    tags = bytearray((m + 1) * width)
+    prev2 = None                      # i-2 行
+    prev = [0] * width                # i=0 行：只能一路新增（跳过不计分），全为 0
+    for jj in range(1, width):
+        tags[jj] = TAG_ADD
+
+    for i in range(1, m + 1):
+        cur = [0] * width
+        base = i * width
+        tags[base] = TAG_DEL  # 第 0 列只能一路删除
+        oi = i - 1
+        a1_text = ot[oi]
+        a1_len = ol[oi]
+        a1_masks = [gmask[oi] for gmask in om]   # 行常量：旧 oi 在各组散列下的桶掩码
+        a1_occ = [gocc[oi] for gocc in oo]
+        mo1 = mid_o[oi]
+        has_merge = i >= 2
+        mo2 = mid_o[oi - 1] if has_merge else 0
+        if has_merge:
+            a2_len = opl[oi - 1]
+            a2_masks = [gmask[oi - 1] for gmask in opm]
+            a2_occ = [gocc[oi - 1] for gocc in opo]
+            a2_text = opt[oi - 1]
+        prev_local, prev2_local = prev, prev2
+        for j in range(1, width):
+            nj = j - 1
+            b_len, b_masks, b_occ = new_sig_cols[nj]
+            b_text = nt[nj]
+            best = prev_local[j]   # 删除旧 oi
+            tag = TAG_DEL
+
+            v = cur[j - 1]        # 新增新 nj
+            if v > best:
+                best, tag = v, TAG_ADD
+
+            # 1:1 匹配
+            s = _candidate_score(a1_len, a1_masks, a1_occ,
+                                 b_len, b_masks, b_occ, a1_text, b_text)
+            if s is not None:
+                cand = prev_local[j - 1] + round(s * SIM_SCALE) * w \
+                       - abs(mo1 - mid_n[nj])
+                if cand > best:  # 同分保持先到转移，回溯确定
+                    best, tag = cand, TAG_M11
+            if j >= 2:  # 1:2 拆分（旧 oi -> 新 nj-1、nj）
+                pj = nj - 1
+                pb_len, pb_masks, pb_occ = new_pair_cols[pj]
+                s = _candidate_score(a1_len, a1_masks, a1_occ,
+                                     pb_len, pb_masks, pb_occ,
+                                     a1_text, npt[pj])
+                if s is not None:
+                    pen = abs(mo1 - mid_n[pj]) + abs(mo1 - mid_n[nj])
+                    cand = prev_local[j - 2] + round(s * SIM_SCALE) * w - pen
+                    if cand > best:
+                        best, tag = cand, TAG_M12
+            if has_merge:  # 2:1 合并（旧 oi-1、oi -> 新 nj）
+                s = _candidate_score(a2_len, a2_masks, a2_occ,
+                                     b_len, b_masks, b_occ, a2_text, b_text)
+                if s is not None:
+                    pen = abs(mo2 - mid_n[nj]) + abs(mo1 - mid_n[nj])
+                    cand = prev2_local[j - 1] + round(s * SIM_SCALE) * w - pen
+                    if cand > best:
+                        best, tag = cand, TAG_M21
+
+            cur[j] = best
+            tags[base + j] = tag
+        prev2, prev = prev, cur
+
+    # 回溯，按对齐顺序反向收集后再翻转
+    groups = []
+    i, j = m, n
+    while i > 0 or j > 0:
+        if i == 0:
+            groups.append({"kind": "raw_add", "old": [], "new": [j]})
+            j -= 1
+            continue
+        if j == 0:
+            groups.append({"kind": "raw_del", "old": [i], "new": []})
+            i -= 1
+            continue
+        tag = tags[i * width + j]
+        if tag == TAG_DEL:
+            groups.append({"kind": "raw_del", "old": [i], "new": []})
+            i -= 1
+        elif tag == TAG_ADD:
+            groups.append({"kind": "raw_add", "old": [], "new": [j]})
+            j -= 1
+        elif tag == TAG_M11:
+            oi, nj = i - 1, j - 1
+            groups.append({
+                "kind": "raw_11", "old": [i], "new": [j],
+                "score": _try_similarity(old_rec[oi], new_rec[nj]),
+                "gap_ms": abs(mid_o[oi] - mid_n[nj]) / 2,
+            })
+            i -= 1
+            j -= 1
+        elif tag == TAG_M12:
+            oi = i - 1
+            pen = abs(mid_o[oi] - mid_n[j - 2]) + abs(mid_o[oi] - mid_n[j - 1])
+            groups.append({
+                "kind": "raw_split", "old": [i], "new": [j - 1, j],
+                "score": _try_similarity(old_rec[oi], new_pair_rec[j - 2]),
+                "gap_ms": pen / 4,  # 两组配对的平均中点差
+            })
+            i -= 1
+            j -= 2
+        else:  # TAG_M21
+            nj = j - 1
+            pen = abs(mid_o[i - 2] - mid_n[nj]) + abs(mid_o[i - 1] - mid_n[nj])
+            groups.append({
+                "kind": "raw_merge", "old": [i - 1, i], "new": [j],
+                "score": _try_similarity(old_pair_rec[i - 2], new_rec[nj]),
+                "gap_ms": pen / 4,  # 两组配对的平均中点差
+            })
+            i -= 2
+            j -= 1
+    groups.reverse()
+    return groups
+
+
+def _classify_group(g: dict, old_entries, new_entries) -> str:
+    """根据形态与归一化正文判定展示类型。
+
+    1:1 且拼接后归一化正文完全相同 -> unchanged；否则 changed。
+    1:2 / 2:1 一律为 split / merge（组级整体比较，不把拆并后的
+    段落逐条对撞而误报改词/删除/新增）。
+    """
+    kind = g["kind"]
+    if kind == "raw_11":
+        ob = _norm_body(old_entries, [x - 1 for x in g["old"]])
+        nb = _norm_body(new_entries, [x - 1 for x in g["new"]])
+        return "unchanged" if ob == nb else "changed"
+    return {"raw_split": "split", "raw_merge": "merge",
+            "raw_del": "delete", "raw_add": "add"}[kind]
+
+
+def _diff_entry_side(entries: List[dict], seq: int) -> dict:
+    e = entries[seq - 1]
+    return {
+        "seq": seq,
+        "index": e["index"],
+        "time": f"{fmt_time(e['start'])} --> {fmt_time(e['end'])}",
+        "text": "\n".join(e["lines"]),
+    }
+
+
+def _diff_prepare(req: "DiffRequest"):
+    """差异对照公共预处理：解析两轨并校验空时长 / 倒置，失败抛 400。"""
+    try:
+        old_entries = parse_srt(req.old_srt)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"旧版 SRT 解析失败：{e}")
+    try:
+        new_entries = parse_srt(req.new_srt)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"新版 SRT 解析失败：{e}")
+    try:
+        _validate_diff_track(old_entries, "旧版")
+        _validate_diff_track(new_entries, "新版")
+        groups = align_diff(old_entries, new_entries)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return old_entries, new_entries, groups
+
+
+def _diff_group_payload(g: dict, old_entries, new_entries, group_seq: int) -> dict:
+    typ = _classify_group(g, old_entries, new_entries)
+    old_side = [_diff_entry_side(old_entries, s) for s in g["old"]]
+    new_side = [_diff_entry_side(new_entries, s) for s in g["new"]]
+    payload = {
+        "seq": group_seq,
+        "type": typ,
+        "old": old_side,
+        "new": new_side,
+    }
+    if "score" in g:
+        # 拆分/合并时各组成条与整体正文不同，附带「正文是否已变」便于预览标注
+        changed = _norm_body(old_entries, [x - 1 for x in g["old"]]) != \
+            _norm_body(new_entries, [x - 1 for x in g["new"]])
+        payload["similarity"] = round(g["score"], 4)
+        payload["gap_ms"] = int(round(g["gap_ms"]))
+        payload["text_changed"] = changed if typ in ("split", "merge") else (typ == "changed")
+    return payload
+
+
+def _diff_payload(old_entries, new_entries, groups) -> dict:
+    items = [
+        _diff_group_payload(g, old_entries, new_entries, k)
+        for k, g in enumerate(groups, 1)
+    ]
+    counts = {"unchanged": 0, "changed": 0, "split": 0,
+              "merge": 0, "delete": 0, "add": 0}
+    total_sim = 0.0
+    matched_groups = 0
+    for it in items:
+        counts[it["type"]] += 1
+        if "similarity" in it:
+            total_sim += it["similarity"]
+            matched_groups += 1
+    return {
+        "old_count": len(old_entries),
+        "new_count": len(new_entries),
+        "group_count": len(items),
+        "counts": counts,
+        "matched_group_count": matched_groups,
+        "total_similarity": round(total_sim, 4),
+        "avg_similarity": round(total_sim / matched_groups, 4) if matched_groups else None,
+        "groups": items,
+    }
+
+
+@app.post("/api/diff/preview")
+def diff_preview(req: DiffRequest):
+    old_entries, new_entries, groups = _diff_prepare(req)
+    return _diff_payload(old_entries, new_entries, groups)
+
+
+_DIFF_CSV_HEADER = ["组号", "差异类型", "相似度", "时间差(ms)",
+                    "旧版序号", "旧版时间", "旧版正文",
+                    "新版序号", "新版时间", "新版正文"]
+_DIFF_TYPE_CN = {
+    "unchanged": "未变", "changed": "改词", "split": "拆分",
+    "merge": "合并", "delete": "删除", "add": "新增",
+}
+
+
+def _diff_csv_side(side: List[dict], field: str) -> str:
+    return "\n----\n".join(str(x[field]) for x in side)
+
+
+@app.post("/api/diff/export")
+def diff_export(req: DiffRequest):
+    old_entries, new_entries, groups = _diff_prepare(req)
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\r\n")  # RFC 4180：CRLF、按需加引号
+    writer.writerow(_DIFF_CSV_HEADER)
+    for k, g in enumerate(groups, 1):
+        it = _diff_group_payload(g, old_entries, new_entries, k)
+        writer.writerow([
+            k,
+            _DIFF_TYPE_CN[it["type"]],
+            it.get("similarity", ""),
+            it.get("gap_ms", ""),
+            _diff_csv_side(it["old"], "index"),
+            _diff_csv_side(it["old"], "time"),
+            _diff_csv_side(it["old"], "text"),
+            _diff_csv_side(it["new"], "index"),
+            _diff_csv_side(it["new"], "time"),
+            _diff_csv_side(it["new"], "text"),
+        ])
+    # UTF-8 BOM，确保 Excel 直接双击打开时中文不乱码
+    return Response(
+        content=b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="srt_diff.csv"'},
     )

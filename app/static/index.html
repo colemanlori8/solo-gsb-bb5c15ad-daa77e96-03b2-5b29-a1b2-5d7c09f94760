@@ -62,6 +62,27 @@
   .unmatched-list tr.unmatched { background: #fffbeb; }
   .merged-tag { display: inline-block; background: #dbeafe; color: #1d4ed8; border-radius: 4px;
           padding: 1px 6px; font-size: 12px; margin-left: 4px; }
+  /* ---- SRT 修订差异对照 ---- */
+  .diff-side .tr-meta { color: #6b7280; font-size: 12px; margin-bottom: 2px; }
+  .diff-entry { border: 1px dashed #d1d5db; border-radius: 6px; padding: 4px 8px;
+          margin-bottom: 4px; background: #fff; }
+  .diff-none { color: #9ca3af; font-size: 12px; padding: 4px 2px; }
+  .diff-type { display: inline-block; border-radius: 4px; padding: 2px 8px; font-size: 12px;
+          font-weight: 600; white-space: nowrap; }
+  .diff-type.unchanged { background: #ecfdf5; color: #047857; }
+  .diff-type.changed   { background: #fef3c7; color: #92400e; }
+  .diff-type.split     { background: #dbeafe; color: #1d4ed8; }
+  .diff-type.merge     { background: #ede9fe; color: #6d28d9; }
+  .diff-type.delete    { background: #fee2e2; color: #b91c1c; }
+  .diff-type.add       { background: #dcfce7; color: #15803d; }
+  tr.diff-row-unchanged td { background: #fafafa; }
+  tr.diff-row-changed   td { background: #fffbeb; }
+  tr.diff-row-split     td { background: #eff6ff; }
+  tr.diff-row-merge     td { background: #f5f3ff; }
+  tr.diff-row-delete    td { background: #fef2f2; }
+  tr.diff-row-add       td { background: #f0fdf4; }
+  .diff-meta { color: #6b7280; font-size: 12px; }
+  .diff-changed-note { font-size: 12px; color: #b45309; margin-left: 6px; }
 </style>
 </head>
 <body>
@@ -184,6 +205,43 @@
   </div>
   <div id="speedMessage"></div>
   <div id="speedResult"></div>
+</div>
+
+<hr class="feature-divider">
+<h1 id="diff">SRT 修订差异对照</h1>
+<p class="hint">分别粘贴或上传<strong>旧版</strong>与<strong>新版</strong>两份 SRT，自动按顺序对齐两版字幕并逐组对照。
+对齐在<strong>保持原有顺序</strong>的前提下做全局动态规划，每组允许 <strong>1:1（改词/未变）、1:2（拆分）、2:1（合并）以及单侧跳过（删除/新增）</strong>。
+相似度基于<strong>去除空白与标点并小写化</strong>后的正文计算，只有相似度 <strong>≥ 0.5</strong> 的组合才允许匹配；
+全局优先<strong>最大化相似度总和</strong>，总分相同时选择<strong>时间差总和更小</strong>的方案。
+拆分组与合并组按整段对照，不会把拆分/合并后的段落误报成改词或删除/新增。</p>
+
+<div class="card">
+  <h2>10. 两版字幕内容</h2>
+  <div class="track-grid">
+    <div class="track-box">
+      <h3>旧版 SRT
+        <input type="file" id="diffOldFile" accept=".srt,.txt" style="font-size:12px;font-weight:normal">
+      </h3>
+      <textarea id="diffOld" placeholder="1&#10;00:00:01,000 --> 00:00:03,000&#10;旧版第一句&#10;&#10;2&#10;00:00:04,000 --> 00:00:06,000&#10;旧版第二句"></textarea>
+    </div>
+    <div class="track-box">
+      <h3>新版 SRT
+        <input type="file" id="diffNewFile" accept=".srt,.txt" style="font-size:12px;font-weight:normal">
+      </h3>
+      <textarea id="diffNew" placeholder="1&#10;00:00:01,000 --> 00:00:03,000&#10;新版第一句&#10;&#10;2&#10;00:00:04,000 --> 00:00:06,000&#10;新版第二句"></textarea>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>11. 预览与下载差异 CSV</h2>
+  <div class="toolbar">
+    <button onclick="diffPreview()">预览差异对照</button>
+    <button id="diffExportBtn" onclick="diffExport()" disabled>下载 UTF-8 CSV</button>
+    <span class="hint" id="diffExportHint">请先预览，两版校验通过后才能下载</span>
+  </div>
+  <div id="diffMessage"></div>
+  <div id="diffResult"></div>
 </div>
 
 <script>
@@ -659,6 +717,98 @@ async function speedExport() {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "speed_fixed.srt";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ------------------------------------------------------------ SRT 修订差异对照
+
+bindTrackFile("diffOldFile", "diffOld");
+bindTrackFile("diffNewFile", "diffNew");
+
+const DIFF_TYPE_CN = {
+  unchanged: "未变", changed: "改词", split: "拆分",
+  merge: "合并", delete: "删除", add: "新增",
+};
+
+function diffPayload() {
+  return JSON.stringify({ old_srt: $("diffOld").value, new_srt: $("diffNew").value });
+}
+
+function showDiffError(msg) {
+  $("diffMessage").innerHTML = `<div class="error">⚠ ${escapeHtml(msg)}</div>`;
+  $("diffResult").innerHTML = "";
+  $("diffExportBtn").disabled = true;
+}
+
+function renderDiffSide(entries) {
+  if (!entries.length) return `<div class="diff-none">— 无 —</div>`;
+  return entries.map(e => `
+    <div class="diff-entry">
+      <div class="diff-meta">#${e.seq}（原序号 ${escapeHtml(e.index)}） · ${escapeHtml(e.time)}</div>
+      <div class="mono">${escapeHtml(e.text)}</div>
+    </div>`).join("");
+}
+
+function renderDiffPreview(pv) {
+  const rows = pv.groups.map(g => {
+    let meta = "";
+    if (g.similarity != null) {
+      meta = `<span class="diff-meta">相似度 ${g.similarity.toFixed(3)} · 时间差 ${g.gap_ms} ms</span>`;
+      if ((g.type === "split" || g.type === "merge") && g.text_changed) {
+        meta += `<span class="diff-changed-note">（正文同时有改动）</span>`;
+      }
+    }
+    return `
+    <tr class="diff-row-${g.type}">
+      <td>${g.seq}</td>
+      <td><span class="diff-type ${g.type}">${DIFF_TYPE_CN[g.type]}</span><br>${meta}</td>
+      <td class="diff-side">${renderDiffSide(g.old)}</td>
+      <td class="diff-side">${renderDiffSide(g.new)}</td>
+    </tr>`;
+  }).join("");
+  $("diffResult").innerHTML = `<table>
+    <tr><th style="width:3em">组</th><th style="width:9em">类型</th><th>旧版（原序号 / 时间 / 正文）</th><th>新版（原序号 / 时间 / 正文）</th></tr>
+    ${rows}</table>`;
+  const c = pv.counts;
+  const badge = t => `<span class="diff-type ${t}">${DIFF_TYPE_CN[t]} ${c[t]}</span>`;
+  const avg = pv.avg_similarity == null ? "—" : pv.avg_similarity.toFixed(3);
+  $("diffMessage").innerHTML =
+    `<div class="ok-banner">✓ 旧版 ${pv.old_count} 条 / 新版 ${pv.new_count} 条，` +
+    `对齐为 ${pv.group_count} 组；平均相似度 ${avg}。&nbsp; ` +
+    [badge("unchanged"), badge("changed"), badge("split"), badge("merge"),
+     badge("delete"), badge("add")].join(" ") + `</div>`;
+  $("diffExportBtn").disabled = false;
+}
+
+async function diffPreview() {
+  $("diffMessage").innerHTML = "";
+  let res;
+  try {
+    res = await fetch("/api/diff/preview", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: diffPayload(),
+    });
+  } catch (e) { return showDiffError("网络错误：" + e); }
+  const data = await res.json();
+  if (res.ok) return renderDiffPreview(data);
+  return showDiffError((typeof data.detail === "string") ? data.detail : "请求失败");
+}
+
+async function diffExport() {
+  let res;
+  try {
+    res = await fetch("/api/diff/export", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: diffPayload(),
+    });
+  } catch (e) { return showDiffError("网络错误：" + e); }
+  if (!res.ok) {
+    const data = await res.json();
+    return showDiffError((typeof data.detail === "string") ? data.detail : "下载被拒绝");
+  }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "srt_diff.csv";
   a.click();
   URL.revokeObjectURL(a.href);
 }
