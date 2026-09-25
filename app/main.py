@@ -4,8 +4,11 @@
 按原时刻排序后在相邻锚点间做线性插值，两端按最近一段的斜率外推，
 统一换算每条字幕的起止时间，并检测负时间 / 起止倒置 / 与下一条重叠。
 """
+import csv
+import io
 import math
 import re
+import unicodedata
 from pathlib import Path
 from typing import List
 
@@ -13,7 +16,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复")
+app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -1093,4 +1096,282 @@ def speed_export(req: SpeedRequest):
         content=content.encode("utf-8"),
         media_type="application/x-subrip",
         headers={"Content-Disposition": 'attachment; filename="speed_fixed.srt"'},
+    )
+
+
+# ---------------------------------------------------------------- SRT 修订差异对照
+
+class DiffRequest(BaseModel):
+    old_srt: str  # 旧版 SRT
+    new_srt: str  # 新版 SRT
+
+
+DIFF_SIM_THRESHOLD = 0.5     # 组合正文相似度达到该值才允许匹配
+MAX_DIFF_STATES = 1_000_000  # 对齐 DP 状态数上限（旧版条数 × 新版条数）
+
+DIFF_TYPE_LABELS = {
+    "unchanged": "未变",
+    "modified": "改词",
+    "split": "拆分",
+    "merged": "合并",
+    "deleted": "删除",
+    "added": "新增",
+}
+
+
+def _diff_norm(lines: List[str]) -> str:
+    """差异对照的正文归一化：去除所有空白与标点字符后再参与相似度计算。"""
+    return "".join(
+        ch for ln in lines for ch in ln
+        if not ch.isspace() and not unicodedata.category(ch).startswith(("P", "Z"))
+    )
+
+
+def _diff_grams(t: str) -> frozenset:
+    """归一化正文的特征集：相邻双字符（bigram）集合；单字符退化为自身。"""
+    if not t:
+        return frozenset()
+    if len(t) < 2:
+        return frozenset((t,))
+    return frozenset(zip(t, t[1:]))
+
+
+def align_diff(olds: List[dict], news: List[dict]):
+    """保持顺序的全局动态规划对齐。
+
+    状态 (i, j) 为旧版第 i 条、新版第 j 条起的后缀最优对齐，转移允许：
+    1:1（旧 i ↔ 新 j）、1:2（旧 i ↔ 新 j..j+1，拆分）、2:1（旧 i..i+1 ↔ 新 j，
+    合并）、跳过旧 i（删除）、跳过新 j（新增）。仅归一化正文相似度
+    （bigram 集合 Dice 系数 2|A∩B|/(|A|+|B|)）≥ 0.5 的组合允许匹配。
+
+    两级目标编码为单个整数取大：相似度 × 1e6 取整 × BIG − 时间差，即
+    总相似度最大优先，同分时总时间差（|起点差|+|终点差|，毫秒）最小优先；
+    BIG 大于任何可能的总时间差，保证两级目标不串级。
+
+    值数组按三行滚动（转移只触及 i+1、i+2 行），回溯矩阵每状态 1 字节。
+    返回 [(move, 旧下标列表, 新下标列表)]，
+    move ∈ 1:1 / split / merged / deleted / added。
+    """
+    m, n = len(olds), len(news)
+    if m * n > MAX_DIFF_STATES:
+        raise ValueError(
+            f"字幕条数过多（旧版 {m} 条 × 新版 {n} 条，对齐状态数超过 "
+            f"{MAX_DIFF_STATES}），请将文件分段后再对照"
+        )
+
+    on = [_diff_norm(e["lines"]) for e in olds]
+    nn = [_diff_norm(e["lines"]) for e in news]
+    og = [_diff_grams(t) for t in on]
+    ng = [_diff_grams(t) for t in nn]
+    og2 = [_diff_grams(on[i] + on[i + 1]) for i in range(m - 1)]
+    ng2 = [_diff_grams(nn[j] + nn[j + 1]) for j in range(n - 1)]
+    ogs = [len(g) for g in og]
+    ngs = [len(g) for g in ng]
+    og2s = [len(g) for g in og2]
+    ng2s = [len(g) for g in ng2]
+    os_ = [e["start"] for e in olds]
+    oe = [e["end"] for e in olds]
+    ns = [e["start"] for e in news]
+    ne = [e["end"] for e in news]
+
+    BIG = 1 << 55  # 大于任意可行对齐的总时间差（匹配条数 × 2 × 最大时刻毫秒）
+    rows = [[0] * (n + 1) for _ in range(3)]
+    choice = bytearray(m * n)  # 每状态 1 字节：1=1:1 2=拆分 3=合并 4=删旧 5=增新
+
+    for i in range(m - 1, -1, -1):
+        cur = rows[i % 3]
+        down1 = rows[(i + 1) % 3]
+        down2 = rows[(i + 2) % 3]
+        gi, si_, sti, eni = og[i], ogs[i], os_[i], oe[i]
+        has2 = i + 2 <= m
+        if has2:
+            gi2, si2, eni1 = og2[i], og2s[i], oe[i + 1]
+        base = i * n
+        for j in range(n - 1, -1, -1):
+            best = down1[j]          # 跳过旧版 i（删除）
+            mv = 4
+            c = cur[j + 1]           # 跳过新版 j（新增）
+            if c > best:
+                best = c
+                mv = 5
+            # 1:1；尺寸预过滤：Dice ≥ 0.5 要求 4·min(|A|,|B|) ≥ |A|+|B|
+            sj = ngs[j]
+            den = si_ + sj
+            if den and 4 * min(si_, sj) >= den:
+                inter = len(gi & ng[j])
+                if 4 * inter >= den:
+                    td = abs(sti - ns[j]) + abs(eni - ne[j])
+                    c = down1[j + 1] + int(2_000_000.0 * inter / den + 0.5) * BIG - td
+                    if c > best:
+                        best = c
+                        mv = 1
+            # 1:2（旧 1 条在新版拆为 2 条，按合并后的整段正文计算相似度）
+            if j + 2 <= n:
+                sj2 = ng2s[j]
+                den = si_ + sj2
+                if den and 4 * min(si_, sj2) >= den:
+                    inter = len(gi & ng2[j])
+                    if 4 * inter >= den:
+                        td = abs(sti - ns[j]) + abs(eni - ne[j + 1])
+                        c = down1[j + 2] + int(2_000_000.0 * inter / den + 0.5) * BIG - td
+                        if c > best:
+                            best = c
+                            mv = 2
+            # 2:1（旧 2 条在新版并为 1 条，按合并后的整段正文计算相似度）
+            if has2:
+                den = si2 + sj
+                if den and 4 * min(si2, sj) >= den:
+                    inter = len(gi2 & ng[j])
+                    if 4 * inter >= den:
+                        td = abs(sti - ns[j]) + abs(eni1 - ne[j])
+                        c = down2[j + 1] + int(2_000_000.0 * inter / den + 0.5) * BIG - td
+                        if c > best:
+                            best = c
+                            mv = 3
+            cur[j] = best
+            choice[base + j] = mv
+
+    groups = []
+    i = j = 0
+    while i < m or j < n:
+        if i >= m:
+            groups.append(("added", [], [j]))
+            j += 1
+        elif j >= n:
+            groups.append(("deleted", [i], []))
+            i += 1
+        else:
+            mv = choice[i * n + j]
+            if mv == 1:
+                groups.append(("1:1", [i], [j]))
+                i += 1
+                j += 1
+            elif mv == 2:
+                groups.append(("split", [i], [j, j + 1]))
+                i += 1
+                j += 2
+            elif mv == 3:
+                groups.append(("merged", [i, i + 1], [j]))
+                i += 2
+                j += 1
+            elif mv == 4:
+                groups.append(("deleted", [i], []))
+                i += 1
+            else:
+                groups.append(("added", [], [j]))
+                j += 1
+    return groups
+
+
+def _diff_side(entries: List[dict], idxs: List[int]) -> dict:
+    """组内一侧的展示结构：原序号、时间跨度、合并正文与逐条明细。"""
+    items = [
+        {
+            "index": entries[k]["index"],
+            "time": f"{fmt_time(entries[k]['start'])} --> {fmt_time(entries[k]['end'])}",
+            "text": "\n".join(entries[k]["lines"]),
+        }
+        for k in idxs
+    ]
+    return {
+        "indices": "+".join(e["index"] for e in items),
+        "span": (f"{fmt_time(entries[idxs[0]]['start'])} --> "
+                 f"{fmt_time(entries[idxs[-1]]['end'])}") if idxs else "",
+        "text": "\n".join(e["text"] for e in items),
+        "items": items,
+    }
+
+
+def _diff_groups_payload(olds: List[dict], news: List[dict], raw_groups: list):
+    """把对齐结果整理为按组展示的结构并统计各类型数量。
+
+    1:1 组按归一化正文是否完全相同再分「未变 / 改词」；拆分、合并按整组
+    对照（合并后的整段正文参与相似度计算），避免误报为整段删除 + 新增。
+    """
+    on = [_diff_norm(e["lines"]) for e in olds]
+    nn = [_diff_norm(e["lines"]) for e in news]
+    og = [_diff_grams(t) for t in on]
+    ng = [_diff_grams(t) for t in nn]
+    groups = []
+    counts = {k: 0 for k in DIFF_TYPE_LABELS}
+    for move, oi, ni in raw_groups:
+        if move == "1:1":
+            gtype = "unchanged" if on[oi[0]] == nn[ni[0]] else "modified"
+        else:
+            gtype = move
+        sim = td = None
+        if oi and ni:
+            ga = og[oi[0]] if len(oi) == 1 else _diff_grams("".join(on[k] for k in oi))
+            gb = ng[ni[0]] if len(ni) == 1 else _diff_grams("".join(nn[k] for k in ni))
+            den = len(ga) + len(gb)
+            sim = round(2.0 * len(ga & gb) / den, 4) if den else 1.0
+            td = (abs(olds[oi[0]]["start"] - news[ni[0]]["start"])
+                  + abs(olds[oi[-1]]["end"] - news[ni[-1]]["end"]))
+        counts[gtype] += 1
+        groups.append({
+            "seq": len(groups) + 1,
+            "type": gtype,
+            "type_label": DIFF_TYPE_LABELS[gtype],
+            "similarity": sim,
+            "time_diff_ms": td,
+            "old": _diff_side(olds, oi),
+            "new": _diff_side(news, ni),
+        })
+    return groups, counts
+
+
+def _diff_prepare(req: DiffRequest):
+    """差异对照公共预处理：解析两版、校验无效时段并全局对齐，失败抛 400。"""
+    try:
+        olds = parse_srt(req.old_srt)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"旧版 SRT 解析失败：{e}")
+    try:
+        news = parse_srt(req.new_srt)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"新版 SRT 解析失败：{e}")
+    try:
+        _validate_track_duration(olds, "旧版")
+        _validate_track_duration(news, "新版")
+        groups = align_diff(olds, news)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return olds, news, groups
+
+
+@app.post("/api/diff/preview")
+def diff_preview(req: DiffRequest):
+    olds, news, raw_groups = _diff_prepare(req)
+    groups, counts = _diff_groups_payload(olds, news, raw_groups)
+    return {
+        "old_count": len(olds),
+        "new_count": len(news),
+        "group_count": len(groups),
+        "counts": counts,
+        "groups": groups,
+    }
+
+
+@app.post("/api/diff/export")
+def diff_export(req: DiffRequest):
+    olds, news, raw_groups = _diff_prepare(req)
+    groups, _counts = _diff_groups_payload(olds, news, raw_groups)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["组号", "类型", "相似度", "时间差(ms)",
+                     "旧版序号", "旧版时间", "旧版正文", "新版序号", "新版时间", "新版正文"])
+    for g in groups:
+        writer.writerow([
+            g["seq"],
+            g["type_label"],
+            "" if g["similarity"] is None else f"{g['similarity']:.4f}",
+            "" if g["time_diff_ms"] is None else g["time_diff_ms"],
+            g["old"]["indices"], g["old"]["span"], g["old"]["text"],
+            g["new"]["indices"], g["new"]["span"], g["new"]["text"],
+        ])
+    return Response(
+        # 带 BOM 的 UTF-8：Excel 等工具直接打开中文不乱码
+        content=buf.getvalue().encode("utf-8-sig"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="srt_diff.csv"'},
     )
